@@ -42,7 +42,7 @@ multi-threading, so it's safe to point at a real library and walk away.
 Requires **Python 3.11+**.
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/m4aforge.git
+git clone https://github.com/S0mthingIDK/m4aforge.git
 cd m4aforge
 pip install -r requirements.txt
 ```
