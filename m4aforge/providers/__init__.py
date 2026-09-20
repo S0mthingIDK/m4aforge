@@ -1,0 +1,1 @@
+"""Metadata providers — one implementation per upstream API."""
