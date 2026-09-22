@@ -233,3 +233,47 @@ def test_worker_pool_is_actually_concurrent() -> None:
     elapsed = time.monotonic() - start
 
     assert elapsed < 0.4
+
+def test_resolve_metadata_merges_complementary_providers() -> None:
+    """When iTunes wins on score but Genius has lyrics/artwork the spine
+    lacks, fields should merge."""
+    # Spine: iTunes candidate with album + track# but no lyrics.
+    itunes_hit = TrackMetadata(
+        title="Song",
+        artist="Artist",
+        album="Album A",
+        track_number=3,
+        source_provider="itunes",
+        artwork_url="http://itunes.example/art.jpg",
+    )
+    # Complementary: Genius with the same song but no album/track#.
+    genius_hit = TrackMetadata(
+        title="Song",
+        artist="Artist",
+        year="2020",
+        artwork_url="http://genius.example/art.jpg",
+        source_provider="genius",
+    )
+
+    class Scripted(MetadataProvider):
+        def __init__(self, name: str, hit: TrackMetadata) -> None:
+            self.name = name
+            self._hit = hit
+
+        def search_multi(self, query, duration=None):
+            return [self._hit]
+
+    result = resolve_metadata(
+        Path("Artist - Song.m4a"),
+        "Artist - Song",
+        [Scripted("itunes", itunes_hit), Scripted("genius", genius_hit)],
+        max_retries=0,
+        backoff_seconds=0,
+        min_confidence=0.0,
+    )
+
+    assert result.best is not None
+    assert result.best.album == "Album A"        # from iTunes
+    assert result.best.track_number == 3         # from iTunes
+    assert result.best.year == "2020"            # merged from Genius
+    assert result.best.artwork_url == "http://itunes.example/art.jpg"  # spine wins

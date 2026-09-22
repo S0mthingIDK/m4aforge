@@ -1,0 +1,33 @@
+{
+  "folder": ".",
+  "overwrite_existing": false,
+  "provider_priority": ["itunes", "musicbrainz", "discogs", "genius", "ollama"],
+
+  "discogs_token": "",
+  "genius_token": "",
+
+  "cache_enabled": true,
+  "cache_db_path": "cache.db",
+  "cache_max_age_days": 30,
+
+  "embed_lyrics": true,
+  "embed_artwork": true,
+  "min_artwork_resolution": 500,
+
+  "ollama_enabled": false,
+  "ollama_host": "http://localhost:11434",
+  "ollama_model": "llama3",
+
+  "backup_enabled": true,
+  "backup_root": "backups",
+  "backup_retention": 5,
+  "max_workers": 4,
+
+  "report_dir": "reports",
+  "plugins_dir": "plugins",
+  "interactive": false,
+  "theme": "default",
+
+  "min_confidence": 0.60,
+  "strict_confidence": false
+}

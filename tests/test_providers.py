@@ -125,10 +125,21 @@ def test_musicbrainz_raises_not_found_on_empty() -> None:
         provider.search("Nonexistent Song")
 
 
-def test_musicbrainz_raises_blocked_on_503() -> None:
-    session = _mock_session(503, {})
+def test_musicbrainz_raises_blocked_on_403() -> None:
+    """403 is an explicit refusal — the fallback chain should skip
+    MusicBrainz for the rest of the track."""
+    session = _mock_session(403, {})
     provider = MusicBrainzProvider(session=session)
     with pytest.raises(ProviderBlockedError):
+        provider.search("Artist Song")
+
+
+def test_musicbrainz_raises_response_error_on_503() -> None:
+    """503 is transient overload — the retry ladder should handle it,
+    not treat it as a block."""
+    session = _mock_session(503, {})
+    provider = MusicBrainzProvider(session=session)
+    with pytest.raises(ProviderResponseError):
         provider.search("Artist Song")
 
 

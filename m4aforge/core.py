@@ -251,7 +251,7 @@ class Config:
     theme: str = "default"
 
     # Confidence gating
-    min_confidence: float = 0.72
+    min_confidence: float = 0.60
     strict_confidence: bool = False
 
     @classmethod

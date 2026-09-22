@@ -20,7 +20,7 @@ logger = get_logger()
 _SEARCH_URL = "https://musicbrainz.org/ws/2/recording/"
 _MAX_CANDIDATES = 8
 
-_USER_AGENT = "M4AForge/1.0.0 (https://github.com/S0mthingIDK/M4AForge)"
+_USER_AGENT = "M4AForge/1.0.2 (https://github.com/S0mthingIDK/m4aforge)"
 
 
 class MusicBrainzProvider(MetadataProvider):
@@ -47,7 +47,11 @@ class MusicBrainzProvider(MetadataProvider):
         except requests.RequestException as exc:
             raise ProviderResponseError(f"MusicBrainz request failed for '{query}': {exc}") from exc
 
-        if response.status_code in (403, 429, 503):
+        # 403 = explicitly forbidden, 429 = rate limited — treat as a block
+        # and skip this provider for the run. 503 = transient overload;
+        # letting it fall through to ProviderResponseError gives the retry
+        # ladder (in net.py) a chance to back off and try again.
+        if response.status_code in (403, 429):
             raise ProviderBlockedError(
                 f"MusicBrainz blocked the request (status {response.status_code})"
             )

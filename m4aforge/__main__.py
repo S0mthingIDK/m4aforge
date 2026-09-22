@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import replace
 from pathlib import Path
 
 from rich_argparse import RichHelpFormatter
@@ -30,7 +29,6 @@ from m4aforge.ui import (
     make_progress,
     print_banner,
     print_summary_table,
-    prompt_provider_selection,
 )
 
 
@@ -67,13 +65,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--verbose", action="store_true", default=None, help="Enable verbose (debug) logging"
     )
-    parser.add_argument(
-        "--no-prompt",
-        "-y",
-        action="store_true",
-        dest="no_prompt",
-        help="Skip the interactive provider-selection prompt (use config order)",
-    )
     return parser.parse_args(argv)
 
 
@@ -84,30 +75,6 @@ def build_config(args: argparse.Namespace) -> Config:
     )
     config.validate()
     return config
-
-
-def _apply_provider_selection(console, config: Config) -> Config | None:
-    """Prompt the user for provider order; return an updated Config.
-
-    Returns None if the user cancelled.
-    """
-    disabled: dict[str, str] = {}
-    if not config.discogs_token:
-        disabled["discogs"] = "no discogs_token configured"
-    if not config.genius_token:
-        disabled["genius"] = "no genius_token configured"
-
-    all_providers = ["itunes", "musicbrainz", "discogs", "genius", "ollama"]
-
-    try:
-        selected = prompt_provider_selection(
-            console, all_providers, config.provider_priority, disabled,
-        )
-    except (KeyboardInterrupt, EOFError):
-        console.print("\n[warning]Cancelled.[/warning]")
-        return None
-
-    return replace(config, provider_priority=selected)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -123,20 +90,11 @@ def main(argv: list[str] | None = None) -> int:
     console = get_console(config.theme)
     print_banner(console)
 
-    # --restore and --report-only never do lookups, so no prompt for them.
     if args.restore is not None:
         return handle_restore(config, args.restore)
 
     if args.report_only:
         return handle_report_only(config)
-
-    # Interactive provider selection (skipped by -y / --no-prompt, and by
-    # non-TTY stdin automatically via prompt_provider_selection()).
-    if not args.no_prompt:
-        updated = _apply_provider_selection(console, config)
-        if updated is None:
-            return 1
-        config = updated
 
     started_at = utc_now()
     try:

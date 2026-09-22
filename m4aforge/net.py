@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional, TypeVar
@@ -61,8 +62,6 @@ class RateLimiter:
                     self._tokens -= 1
                     return
                 wait_time = (1 - self._tokens) * (self._period / self._max_calls)
-            # 1 ms floor — small enough to be accurate, large enough to
-            # avoid a hot spin loop.
             time.sleep(max(wait_time, 0.001))
 
     def _refill_locked(self) -> None:
@@ -104,11 +103,15 @@ _WEIGHT_DURATION = 0.20
 _WEIGHT_COMPLETENESS = 0.10
 _WEIGHT_PROVIDER = 0.05
 
+# Provider reliability priors. MusicBrainz and iTunes share the top
+# weight: MusicBrainz has the most complete release data, but its search
+# tends to surface compilations and live albums over the canonical
+# studio release, so it shouldn't outweigh iTunes when both agree.
 _PROVIDER_WEIGHTS = {
-    "musicbrainz": 1.0,
+    "musicbrainz": 0.85,
     "itunes": 0.85,
-    "discogs": 0.7,
-    "genius": 0.8,
+    "discogs": 0.70,
+    "genius": 0.80,
     "ollama": 0.0,
 }
 
@@ -116,10 +119,67 @@ _DURATION_PERFECT = 2.0
 _DURATION_MAX = 5.0
 
 
+# Album titles matching any of these are compilations, live albums, or
+# promo releases. MusicBrainz in particular surfaces these over the
+# canonical studio release, so we penalize the whole candidate score
+# when its album looks like one of them.
+_BAD_ALBUM_PATTERNS = [
+    re.compile(r"\blive\b", re.IGNORECASE),
+    re.compile(r"\btour\b", re.IGNORECASE),
+    re.compile(r"\bconcert\b", re.IGNORECASE),
+    re.compile(r"\bfestival\b", re.IGNORECASE),
+    re.compile(r"\bgreatest hits\b", re.IGNORECASE),
+    re.compile(r"\bbest of\b", re.IGNORECASE),
+    re.compile(r"\bessential\b", re.IGNORECASE),
+    re.compile(r"\bcompilation\b", re.IGNORECASE),
+    re.compile(r"\bsampler\b", re.IGNORECASE),
+    re.compile(r"\bpromo only\b", re.IGNORECASE),
+    re.compile(r"\banthology\b", re.IGNORECASE),
+    re.compile(r"\bcollection\b", re.IGNORECASE),
+    re.compile(r"\bmixtape\b", re.IGNORECASE),
+    re.compile(r"\bdeluxe\b", re.IGNORECASE),
+    re.compile(r"\bremaster(ed)?\b", re.IGNORECASE),
+    re.compile(r"\bwartime\b", re.IGNORECASE),
+    # Film/TV soundtracks — usually a compilation, rarely the album a
+    # user actually owns for a mainstream song.
+    re.compile(r"\boriginal motion picture\b", re.IGNORECASE),
+    re.compile(r"\boriginal soundtrack\b", re.IGNORECASE),
+    re.compile(r"\bmotion picture soundtrack\b", re.IGNORECASE),
+    # Date-prefixed live bootlegs: "2022-08-18, The Icy Tour: ...".
+    re.compile(r"^\d{4}[-:/ ]"),
+    re.compile(r"\bexpanded edition\b", re.IGNORECASE),
+    re.compile(r"\bdisco fever\b", re.IGNORECASE),
+    re.compile(r"\d+\s+(joints|hits|tracks|songs|classics)\b", re.IGNORECASE),
+    re.compile(r"\(\d{4}\s+yt\)", re.IGNORECASE),
+]
+
+_BAD_ALBUM_PENALTY = 0.75
+
+
+def _album_quality(candidate: TrackMetadata) -> float:
+    """Multiplier in (0, 1] applied to a candidate's score.
+
+    Canonical releases get 1.0; candidates whose album looks like a
+    live set, compilation, or promo get ``_BAD_ALBUM_PENALTY``.
+    """
+    if not candidate.album:
+        return 1.0
+    for pattern in _BAD_ALBUM_PATTERNS:
+        if pattern.search(candidate.album):
+            return _BAD_ALBUM_PENALTY
+    return 1.0
+
+
 def _fuzzy(a: Optional[str], b: Optional[str]) -> Optional[float]:
+    """Case-insensitive fuzzy similarity between two strings.
+
+    RapidFuzz's token_set_ratio is case-sensitive, which would score
+    "twenty one pilots" vs "Twenty One Pilots" at only 0.82. We
+    lowercase both sides first to avoid spurious rejections.
+    """
     if not a or not b:
         return None
-    return fuzz.token_set_ratio(a, b) / 100.0
+    return fuzz.token_set_ratio(a.lower(), b.lower()) / 100.0
 
 
 def _duration_score(query: Optional[float], candidate: Optional[float]) -> Optional[float]:
@@ -148,7 +208,16 @@ def score_candidate(
     query_title: Optional[str],
     query_duration: Optional[float],
 ) -> float:
-    """Return a 0..1 confidence score for a single candidate."""
+    """Return a 0..1 confidence score for a single candidate.
+
+    A candidate that supplies neither a title nor an artist is scored 0
+    outright — there is nothing to verify it against, and letting such
+    candidates win the spine vote (as Discogs release-level results
+    occasionally did) corrupts the file with an unrelated album name.
+    """
+    if candidate.title is None and candidate.artist is None:
+        return 0.0
+
     signals: list[tuple[float, float]] = []
 
     title_sim = _fuzzy(query_title, candidate.title)
@@ -171,7 +240,8 @@ def score_candidate(
     total_weight = sum(w for _, w in signals)
     if total_weight <= 0:
         return 0.0
-    return sum(s * w for s, w in signals) / total_weight
+    base_score = sum(s * w for s, w in signals) / total_weight
+    return base_score * _album_quality(candidate)
 
 
 def cross_validate(
@@ -199,12 +269,70 @@ def cross_validate(
 
 
 # =========================================================================
+# Complementary-field merging
+# =========================================================================
+
+def _merge_complementary(
+    spine: TrackMetadata,
+    others: list[tuple[TrackMetadata, float]],
+) -> TrackMetadata:
+    """Fill empty fields on ``spine`` from other high-agreement candidates.
+
+    Candidates are grouped by provider. For each provider we pick the
+    best matching candidate, preferring ones whose album is not flagged
+    by ``_album_quality`` — this is what keeps MusicBrainz from
+    contributing a live-album or compilation name when it also happened
+    to return the canonical studio release.
+    """
+    contributing: set[str] = set()
+    if spine.source_provider:
+        contributing.add(spine.source_provider)
+
+    # Group non-spine candidates by provider, preserving score order.
+    by_provider: dict[str, list[TrackMetadata]] = defaultdict(list)
+    provider_order: list[str] = []
+    for candidate, _score in others:
+        provider = candidate.source_provider or ""
+        if provider in contributing:
+            continue
+        if provider not in by_provider:
+            provider_order.append(provider)
+        by_provider[provider].append(candidate)
+
+    merged = spine
+    for provider in provider_order:
+        chosen: Optional[TrackMetadata] = None
+        fallback: Optional[TrackMetadata] = None
+
+        for candidate in by_provider[provider]:
+            artist_agree = _fuzzy(candidate.artist, merged.artist) or 0.0
+            title_agree = _fuzzy(candidate.title, merged.title) or 0.0
+            if artist_agree < 0.9 or title_agree < 0.9:
+                continue
+            if fallback is None:
+                fallback = candidate
+            if _album_quality(candidate) == 1.0:
+                chosen = candidate
+                break
+
+        if chosen is None:
+            chosen = fallback
+        if chosen is None:
+            continue
+
+        merged = merged.merge(chosen)
+        contributing.add(provider)
+
+    return merged
+
+
+# =========================================================================
 # Query variants + fallback ladder
 # =========================================================================
 
 DEFAULT_BACKOFF_SECONDS = 1.0
 DEFAULT_MAX_RETRIES = 2
-DEFAULT_MIN_CONFIDENCE = 0.72
+DEFAULT_MIN_CONFIDENCE = 0.60
 
 _ARTIST_TITLE_SEPARATOR = re.compile(r"\s+-\s+")
 
@@ -286,7 +414,13 @@ def resolve_metadata(
     backoff_seconds: float = DEFAULT_BACKOFF_SECONDS,
     rate_limiters: Optional[RateLimiterRegistry] = None,
 ) -> MatchResult:
-    """Run the full pipeline and return a scored MatchResult."""
+    """Run the full pipeline and return a scored MatchResult.
+
+    Every provider in ``providers`` is queried. The highest-scoring
+    candidate becomes the "spine"; any candidate from a different
+    provider whose artist+title match the spine at >=0.9 contributes
+    its non-empty fields to fill gaps the spine left empty.
+    """
     variants = build_query_variants(original_path, cleaned_query)
     query_artist, query_title = split_query(cleaned_query)
 
@@ -309,27 +443,33 @@ def resolve_metadata(
     scored = cross_validate(scored)
     scored.sort(key=lambda pair: pair[1], reverse=True)
 
-    best_metadata, best_score = scored[0]
+    spine_metadata, spine_score = scored[0]
+    merged_metadata = _merge_complementary(spine_metadata, scored[1:])
+
+    scored[0] = (merged_metadata, spine_score)
+
     logger.info(
-        "Top candidate for %s: '%s' by '%s' (provider=%s, confidence=%.2f, %d candidates)",
+        "Top candidate for %s: '%s' by '%s' (spine=%s, confidence=%.2f, %d candidates)",
         original_path.name,
-        best_metadata.title,
-        best_metadata.artist,
-        best_metadata.source_provider,
-        best_score,
+        merged_metadata.title,
+        merged_metadata.artist,
+        spine_metadata.source_provider,
+        spine_score,
         len(scored),
     )
 
-    if best_score < min_confidence:
+    # Epsilon guards against float rounding: a score of 0.72 that lands
+    # as 0.7199999999 on disk should not be rejected by a 0.72 gate.
+    if spine_score + 1e-9 < min_confidence:
         logger.info(
             "Below confidence threshold (%.2f < %.2f); not writing %s",
-            best_score,
+            spine_score,
             min_confidence,
             original_path.name,
         )
-        return MatchResult(best=None, confidence=best_score, candidates=scored)
+        return MatchResult(best=None, confidence=spine_score, candidates=scored)
 
-    return MatchResult(best=best_metadata, confidence=best_score, candidates=scored)
+    return MatchResult(best=merged_metadata, confidence=spine_score, candidates=scored)
 
 
 # =========================================================================
@@ -345,12 +485,7 @@ class WorkerPool:
         self._max_workers = max_workers
 
     def map_unordered(self, fn: Callable[[T], R], items: Iterable[T]) -> Iterator[R]:
-        """Submit ``fn(item)`` for every item and yield results as they complete.
-
-        Cancels pending futures and shuts down immediately on any
-        BaseException (including KeyboardInterrupt), so Ctrl-C doesn't
-        wait on in-flight network I/O.
-        """
+        """Submit ``fn(item)`` for every item and yield results as they complete."""
         executor = ThreadPoolExecutor(max_workers=self._max_workers)
         try:
             futures = {executor.submit(fn, item): item for item in items}

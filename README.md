@@ -8,18 +8,66 @@ iTunes, MusicBrainz, Discogs, and Genius.
 Built with caching, retries, pre-write backups, resume support, and
 multi-threading, so it's safe to point at a real library and walk away.
 
+## How it works
+
+Every track goes through a **merged pipeline** — no provider is
+"chosen" over the others. Each provider is queried, and the best
+fields from each are combined into one record:
+
+```
+1. Clean the filename  →  "Artist - Title"
+2. Ask every provider for candidates
+3. Score every candidate
+   (title, artist, duration, completeness, provider reliability,
+    album-quality penalty)
+4. Highest score = the "spine"
+5. For every empty field on the spine, borrow from any candidate
+   from a different provider whose artist+title match the spine
+   at ≥90% — preferring candidates whose album looks like a
+   canonical release over compilations/live/promo discs
+6. Validate lyrics separately (reject Genius hits whose returned
+   artist or title don't fuzzy-match our metadata at ≥85%)
+7. Write the merged metadata + artwork + lyrics, then rename + backup
+```
+
+**What each provider contributes to the final record:**
+
+| Field | iTunes | MusicBrainz | Discogs | Genius |
+|---|---|---|---|---|
+| title, artist | ✅ | ✅ | | ✅ |
+| album | ✅ | ✅ | ✅ | |
+| genre | ✅ | | ✅ | |
+| year | ✅ | ✅ | ✅ | ✅ |
+| track number | ✅ | | | |
+| duration | ✅ | ✅ | | |
+| artwork | ✅ | | ✅ | ✅ |
+| compilation flag | | | ✅ | |
+| **lyrics** | | | | ✅ |
+
+Genius is the only provider that can supply lyrics; iTunes supplies
+the most fields in a single response. The merge step ensures you get
+both without having to pick.
+
 ## Features
 
-- **Multi-provider lookup** with automatic fallback: iTunes →
-  MusicBrainz → Discogs → Genius, in a configurable per-run order.
-- **Interactive provider picker** — every run shows each provider's
-  availability and lets you choose the fallback order on the spot.
+- **Merged multi-provider lookup** — no provider-selection prompts,
+  no "pick the best one." Every track gets the union of what every
+  provider knows.
 - **Smart filename cleaning** strips `(Official Audio)`, `[HD]`,
   `feat. X`, `(Live)`, `(Remastered)`, leading track numbers, and
   other common download noise before searching.
 - **Confidence gating** — candidates below a score threshold are
   left untouched and reported separately, rather than written on a
-  guess. Duration and cross-provider agreement feed the score.
+  guess. Duration and cross-provider agreement feed the score, and
+  candidates whose album looks like a live set, compilation, promo,
+  or film soundtrack are penalized so the canonical studio release
+  wins the vote.
+- **Lyrics validation** — Genius hits whose returned artist or title
+  don't match the track are rejected, so an unrelated song's lyrics
+  never end up embedded.
+- **Lyrics cleanup** — Genius's editorial description, contributor
+  counts, translation language headers, and production credits are
+  all stripped, leaving only the lyrics body.
 - **Local cache** (SQLite) so re-running on the same library doesn't
   re-hit provider APIs.
 - **File safety**: SHA256 integrity check around every write;
@@ -28,8 +76,8 @@ multi-threading, so it's safe to point at a real library and walk away.
 - **Multi-threaded**, with a per-provider rate limiter so concurrency
   never trips an API ban.
 - **Reports** — CSV, JSON, and HTML summaries of every run, plus a
-  dedicated `uncertain_<run_id>.csv` for tracks that fell below the
-  confidence threshold.
+  dedicated `uncertain_<run_id>.csv` for tracks below the confidence
+  threshold.
 - **Plugin system** for dropping in a custom provider without editing
   core code.
 - **Optional local LLM enrichment** via [Ollama](https://ollama.com).
@@ -52,11 +100,11 @@ No build step — run it with `python -m m4aforge`.
 ## Usage
 
 ```bash
-# Enrich a folder — you'll be prompted to pick providers and order
+# Enrich a folder (dry run: shows what would change, writes nothing)
 python -m m4aforge --folder "C:\Users\you\Music\Downloads" --dry-run
 
-# Same, but skip the prompt and use the config-declared order
-python -m m4aforge --folder "C:\Users\you\Music\Downloads" --dry-run -y
+# Real run
+python -m m4aforge --folder "C:\Users\you\Music\Downloads"
 
 # Use a specific config and 8 worker threads
 python -m m4aforge --folder ~/Music/Downloads --config myconfig.json --workers 8
@@ -74,33 +122,6 @@ python -m m4aforge --report-only
 python -m m4aforge --folder ~/Music/Downloads --verbose
 ```
 
-### Provider selection prompt
-
-Every run (except `--restore` / `--report-only`) starts with a table
-showing each provider's status:
-
-```
-┌─────────────── Provider Selection ───────────────┐
-│ # │ Provider    │ Status         │ Notes          │
-│ 1 │ itunes      │ ✓ ready        │ public API     │
-│ 2 │ musicbrainz │ ✓ ready        │ public API     │
-│ 3 │ discogs     │ ✗ unavailable  │ no token       │
-│ 4 │ genius      │ ✗ unavailable  │ no token       │
-│ 5 │ ollama      │ ✓ ready        │ enrichment     │
-└───────────────────────────────────────────────────┘
-
-Provider order (comma-separated) [itunes,musicbrainz,ollama]:
-```
-
-Type names in the order to try them (e.g. `musicbrainz,itunes,genius`),
-or press Enter to accept the config-declared order. The prompt
-rejects unknown names, token-gated providers marked unavailable, and
-selections with no lookup provider.
-
-Selection is per-run only — `config.json` is not modified. The
-prompt auto-skips on non-TTY stdin (piped input, CI, cron); add
-`-y` / `--no-prompt` to force-skip in a terminal.
-
 ### CLI reference
 
 | Flag | Description |
@@ -111,7 +132,6 @@ prompt auto-skips on non-TTY stdin (piped input, CI, cron); add
 | `--workers N` | Number of worker threads (overrides config). |
 | `--restore [RUN_ID]` | Restore a backed-up run (defaults to the latest) and exit. |
 | `--report-only` | Regenerate CSV/JSON/HTML reports from the existing database and exit. |
-| `--no-prompt`, `-y` | Skip the interactive provider-selection prompt. |
 | `--verbose` | Enable debug-level logging. |
 | `--help` | Show all options. |
 
@@ -152,7 +172,7 @@ sensible defaults, so a missing `config.json` is not an error.
   "interactive": false,
   "theme": "default",
 
-  "min_confidence": 0.72,
+  "min_confidence": 0.60,
   "strict_confidence": false
 }
 ```
@@ -161,7 +181,7 @@ sensible defaults, so a missing `config.json` is not an error.
 |---|---|---|
 | `folder` | `"."` | Folder scanned recursively for `.m4a` files. |
 | `overwrite_existing` | `false` | If `false`, an already-populated tag is left untouched. |
-| `provider_priority` | see above | Order providers are tried in. `"ollama"` is enrichment-only and is skipped as a lookup source. |
+| `provider_priority` | see above | Order providers are queried in. With the merged pipeline every provider contributes regardless of order — this only matters when one provider errors out. |
 | `discogs_token` / `genius_token` | `null` | Required to enable those providers; missing tokens skip the provider with a warning. |
 | `cache_enabled` | `true` | Store lookup results locally so re-runs don't re-hit APIs. |
 | `cache_db_path` | `"cache.db"` | SQLite file used for the cache, checkpoints, and stats. |
@@ -179,7 +199,7 @@ sensible defaults, so a missing `config.json` is not an error.
 | `plugins_dir` | `"plugins"` | Folder scanned for custom plugin `.py` files. |
 | `interactive` | `false` | Review each file's proposed changes before writing. Forces single-threaded execution. |
 | `theme` | `"default"` | `"default"` (color) or `"plain"`. Color also auto-disables on non-TTY output or when `NO_COLOR` is set. |
-| `min_confidence` | `0.72` | Minimum score required before any tag is written. |
+| `min_confidence` | `0.60` | Minimum score required before any tag is written. |
 | `strict_confidence` | `false` | If `true`, an uncertain match raises instead of being recorded. |
 
 Every field is explained in more depth, with examples, in
@@ -198,7 +218,7 @@ Every field is explained in more depth, with examples, in
 Discogs' search endpoint returns release-level data with no
 tracklist, so it never supplies a track title — it's included in the
 chain for album/genre/artwork/compilation data, with the title itself
-coming from iTunes or MusicBrainz.
+coming from iTunes, MusicBrainz, or Genius.
 
 Lyrics are fetched by resolving the song via Genius's official Search
 API, then reading the full lyrics body from the matched song page.
@@ -248,6 +268,16 @@ reports are the human-facing summary.
   blocking; check `logs/m4aforge.log` for `ProviderBlockedError`
   entries. Blocking is never circumvented; the run falls through to
   the next provider.
+- **Metadata is incomplete** — check `reports/uncertain_<run_id>.csv`
+  for the track; the merged pipeline should fill everything except
+  `album_artist`, which no provider exposes. If a specific field is
+  missing, open the report's JSON version and check which candidates
+  were rejected and why.
+- **Lyrics are missing on some tracks** — Genius's search sometimes
+  returns a cover, translation, or unrelated compilation as its top
+  hit. When that happens, M4AForge rejects the hit rather than embed
+  the wrong lyrics, and the track is left with `lyrics=None`. This is
+  intentional.
 - **Undo a bad run** — `python -m m4aforge --restore` restores the
   most recent backup; pass a specific run ID to restore an older one.
 - **Colors look garbled in CI logs** — set `NO_COLOR=1` or
@@ -263,7 +293,7 @@ m4aforge/
   core.py        enums, constants, exceptions, models, Config
   logger.py      rotating file + console logging
   store.py       SQLite: cache, checkpoints, provider stats
-  net.py         rate limiting, retries, scoring, thread pool
+  net.py         rate limiting, retries, scoring, thread pool, merging
   safety.py      integrity, backups, dedupe, album validation
   media.py       scanning, parsing, tag I/O, artwork, lyrics
   pipeline.py    per-file processing, run orchestration
