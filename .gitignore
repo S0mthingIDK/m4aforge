@@ -23,7 +23,6 @@ htmlcov/
 .tox/
 
 # --- Project runtime data (user-specific, must not be committed) -------
-config.json
 logs/
 *.log
 *.db

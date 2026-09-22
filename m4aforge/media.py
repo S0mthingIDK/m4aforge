@@ -19,6 +19,7 @@ from bs4 import BeautifulSoup
 from mutagen import MutagenError
 from mutagen.mp4 import MP4, MP4Cover
 from PIL import Image, UnidentifiedImageError
+from rapidfuzz import fuzz
 
 from m4aforge.core import (
     AUDIO_EXTENSION,
@@ -376,11 +377,69 @@ def fetch_best_artwork(
 # Lyrics
 # =========================================================================
 
+# Lines that Genius injects into every lyrics page but that are never
+# part of the song itself.
 _JUNK_LINE_PATTERNS = [
     re.compile(r"^\s*\d*\s*Embed\s*$", re.IGNORECASE),
     re.compile(r"^\s*You might also like\s*$", re.IGNORECASE),
-    re.compile(r"^\s*\d*\s*Lyrics\s*$", re.IGNORECASE),
+    # "29 Contributors" / "1 Contributor".
+    re.compile(r"^\s*\d+\s+Contributors?\s*$", re.IGNORECASE),
+    # "Translations" header that precedes the language list.
+    re.compile(r"^\s*Translations\s*$", re.IGNORECASE),
+    # "Read More" link text.
+    re.compile(r"^\s*Read More\s*$", re.IGNORECASE),
+    # Production metadata lines: "[Produced by X]", "[Written by Y]".
+    re.compile(
+        r"^\s*\[(Produced|Written|Directed|Composed|Mixed|Mastered|Arranged)"
+        r"\s+by[^\]]*\]\s*$",
+        re.IGNORECASE,
+    ),
+    # "<Anything> Lyrics" heading, e.g. "505 Lyrics" or
+    # "Diet Mountain Dew (The Flight Demo) Lyrics". Bracket-free and short.
+    re.compile(r"^[^\[\]]{0,90}?\bLyrics\s*$", re.IGNORECASE),
 ]
+
+
+# Genius lists translation languages as bare lines before the lyrics body.
+_LANGUAGE_NAMES = frozenset(
+    name.lower()
+    for name in (
+        # Major European
+        "English", "Español", "Spanish", "Português", "Portuguese",
+        "Deutsch", "German", "Français", "French", "Italiano", "Italian",
+        "Polski", "Polish", "Nederlands", "Dutch", "Türkçe", "Turkish",
+        "Русский", "Russian", "Українська", "Ukrainian",
+        "Беларуская", "Belarusian", "Български", "Bulgarian",
+        "Српски", "Srpski", "Serbian", "Hrvatski", "Croatian",
+        "Bosanski", "Bosnian", "Slovenščina", "Slovenian",
+        "Slovenčina", "Slovak", "Česky", "Czech", "Magyar", "Hungarian",
+        "Română", "Romanian", "Ελληνικά", "Greek",
+        "Svenska", "Swedish", "Norsk", "Norwegian", "Dansk", "Danish",
+        "Suomi", "Finnish", "Íslenska", "Icelandic",
+        "Latviešu", "Latvian", "Lietuvių", "Lithuanian",
+        "Eesti", "Estonian", "Shqip", "Albanian",
+        "Cymraeg", "Welsh", "Gaeilge", "Irish", "Gàidhlig",
+        "Euskara", "Basque", "Galego", "Galician", "Català", "Catalan",
+        # Asian / Middle Eastern
+        "日本語", "Japanese", "한국어", "Korean", "中文", "繁體中文", "简体中文",
+        "Chinese", "العربية", "Arabic", "עברית", "Hebrew",
+        "فارسی", "Persian", "Farsi", "اردو", "Urdu", "پښتو", "Pashto",
+        "हिन्दी", "Hindi", "मराठी", "Marathi", "বাংলা", "Bengali",
+        "தமிழ்", "Tamil", "తెలుగు", "Telugu", "ગુજરાતી", "Gujarati",
+        "ਪੰਜਾਬੀ", "Punjabi", "සිංහල", "Sinhala",
+        "ไทย", "Thai", "ລາວ", "Lao", "ភាសាខ្មែរ", "Khmer",
+        "မြန်မာဘာသာ", "Burmese", "Tiếng Việt", "Vietnamese",
+        "Bahasa Indonesia", "Indonesian", "Bahasa Melayu", "Malay",
+        "Basa Jawa", "Javanese", "Filipino", "Tagalog",
+        # Other
+        "Kiswahili", "Swahili", "Azərbaycan", "Azerbaijani",
+        "O'zbek", "Oʻzbek", "Uzbek", "Қазақша", "Kazakh",
+        "Romaji", "Romanization", "Romanized",
+        "Sakha", "Yakut", "саха тыла",
+        "Kreyòl ayisyen", "Haitian Creole",
+    )
+)
+
 
 _BROWSER_HEADERS = {
     "User-Agent": (
@@ -399,6 +458,10 @@ _BROWSER_HEADERS = {
 
 _SEARCH_TO_PAGE_DELAY = 0.6
 _403_RETRY_DELAY = 3.0
+
+# Minimum fuzzy similarity between our (artist, title) and Genius's
+# returned hit. Below this we treat the hit as "not our song".
+_LYRICS_MATCH_THRESHOLD = 0.85
 
 
 class LyricsProvider(ABC):
@@ -425,6 +488,36 @@ class GeniusLyricsProvider(LyricsProvider):
     def fetch(self, artist: str, title: str) -> Optional[str]:
         hit = search_song_hit(f"{artist} {title}", self._token, self._session, self._timeout)
         if hit is None:
+            return None
+
+        # Genius's search will return *any* track that shares a word with
+        # the query. Reject hits whose title or artist doesn't fuzzy-match
+        # our own metadata. Both sides are lowercased first — RapidFuzz's
+        # token_set_ratio is case-sensitive, so "twenty one pilots" vs
+        # "Twenty One Pilots" would otherwise score only 0.82.
+        hit_title = (hit.get("title") or "").strip()
+        hit_artist = ((hit.get("primary_artist") or {}).get("name") or "").strip()
+
+        title_score = (
+            fuzz.token_set_ratio(title.lower(), hit_title.lower()) / 100.0
+            if title and hit_title
+            else 0.0
+        )
+        artist_score = (
+            fuzz.token_set_ratio(artist.lower(), hit_artist.lower()) / 100.0
+            if artist and hit_artist
+            else 0.0
+        )
+
+        if title_score < _LYRICS_MATCH_THRESHOLD or artist_score < _LYRICS_MATCH_THRESHOLD:
+            logger.info(
+                "Genius returned mismatched lyrics candidate "
+                "('%s' by '%s'; title=%.2f, artist=%.2f) — rejecting",
+                hit_title,
+                hit_artist,
+                title_score,
+                artist_score,
+            )
             return None
 
         url = hit.get("url")
@@ -474,19 +567,76 @@ class GeniusLyricsProvider(LyricsProvider):
             return None
 
 
-def clean_lyrics(raw_text: str) -> str:
-    """Strip Genius junk lines and collapse blank-line runs."""
+def _strip_genius_preamble(lines: list[str]) -> list[str]:
+    """Drop the editorial description block that Genius prints before the
+    lyrics body.
+
+    Genius puts a short "About this song" paragraph between the language
+    header and the actual lyrics. The lyrics body always starts with a
+    bracketed section marker — ``[Verse 1]``, ``[Chorus]``,
+    ``[Produced by ...]``, ``[Part I]``, etc. So dropping everything up
+    to the first such line removes the description in one pass.
+    """
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and len(stripped) > 2:
+            return lines[i:]
+
+    # No section markers in this song — fall back to dropping through the
+    # last "Read More" or ellipsis-terminated line (where descriptions end).
+    last_meta = -1
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.lower() == "read more" or stripped.endswith("…"):
+            last_meta = i
+    if last_meta >= 0:
+        return lines[last_meta + 1:]
+
+    return lines
+
+
+def _is_language_name(line: str) -> bool:
+    """True if ``line`` is just a language name (a Genius translation
+    header) rather than a lyric."""
+    normalized = line.strip().lower()
+    if not normalized:
+        return False
+    if normalized in _LANGUAGE_NAMES:
+        return True
+    # Handle bilingual headers like "Русский (Russian)" or "саха тыла (Sakha)".
+    match = re.match(r"^([^(]+?)\s*\(([^)]+)\)\s*$", normalized)
+    if match:
+        left, right = match.group(1).strip(), match.group(2).strip()
+        if left in _LANGUAGE_NAMES or right in _LANGUAGE_NAMES:
+            return True
+    return False
+
+
+def clean_lyrics(raw_text: str, song_title: Optional[str] = None) -> str:
+    """Strip Genius junk from raw lyrics and collapse blank-line runs.
+
+    Three passes:
+      1. Drop the editorial description block (everything before the
+         first ``[Section]`` marker).
+      2. Drop known junk lines (contributor counts, language names,
+         "Read More", ``<Title> Lyrics`` headings).
+      3. Collapse consecutive blank lines.
+    """
     lines = [line.strip() for line in raw_text.splitlines()]
-    kept = []
+    lines = _strip_genius_preamble(lines)
+
+    kept: list[str] = []
     for line in lines:
         if not line:
             kept.append("")
             continue
         if any(p.match(line) for p in _JUNK_LINE_PATTERNS):
             continue
+        if _is_language_name(line):
+            continue
         kept.append(line)
 
-    out = []
+    out: list[str] = []
     for line in kept:
         if line == "" and out and out[-1] == "":
             continue
@@ -520,4 +670,4 @@ def get_lyrics(
     if raw is None:
         return None
 
-    return clean_lyrics(raw)
+    return clean_lyrics(raw, song_title=title)

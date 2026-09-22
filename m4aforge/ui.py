@@ -1,15 +1,12 @@
 """Rich-based console UI: banner, progress, themed output, and the
 interactive review menu.
 
-Replaces the four hand-rolled modules (banner.py, colors.py,
-progress.py, themes.py, menu.py) with a single Rich integration.
 Rich handles terminal capability detection, NO_COLOR/FORCE_COLOR, and
 graceful plain-text fallback automatically.
 """
 
 from __future__ import annotations
 
-import sys
 from dataclasses import fields
 from enum import Enum
 from typing import Optional
@@ -50,11 +47,7 @@ PLAIN_THEME = Theme({kind: "" for kind in DEFAULT_THEME.styles})
 
 
 def get_console(theme_name: str = "default") -> Console:
-    """Return a Rich Console configured with the named theme.
-
-    Rich handles NO_COLOR, FORCE_COLOR, and non-TTY detection natively,
-    so no custom color-support detection is needed.
-    """
+    """Return a Rich Console configured with the named theme."""
     theme = DEFAULT_THEME if theme_name == "default" else PLAIN_THEME
     return Console(theme=theme, soft_wrap=True)
 
@@ -95,107 +88,6 @@ def print_summary_table(console: Console, report) -> None:
     table.add_row("Failed", f"[error]{report.failed}[/error]")
     table.add_row("Elapsed", f"{report.elapsed_seconds:.1f}s")
     console.print(table)
-
-
-# =========================================================================
-# Interactive provider selection
-# =========================================================================
-
-_PROVIDER_NOTES = {
-    "itunes": "public API — no auth needed",
-    "musicbrainz": "public API — no auth needed",
-    "discogs": "release data — needs discogs_token",
-    "genius": "songs + lyrics — needs genius_token",
-    "ollama": "enrichment only — not a lookup source",
-}
-
-
-def prompt_provider_selection(
-    console: Console,
-    all_providers: list[str],
-    current_priority: list[str],
-    disabled_reasons: dict[str, str],
-) -> list[str]:
-    """Show available providers, prompt for order, validate, return selection.
-
-    Auto-returns the current priority (minus disabled providers) when
-    stdin is not a TTY, so piping / CI / scripted runs never block.
-
-    Raises:
-        KeyboardInterrupt: if the user aborts with Ctrl-C.
-        EOFError: if stdin closes mid-prompt.
-    """
-    if not sys.stdin.isatty():
-        return [p for p in current_priority if p not in disabled_reasons]
-
-    table = Table(title="Provider Selection", show_lines=False)
-    table.add_column("#", justify="right", style="muted")
-    table.add_column("Provider", style="bold")
-    table.add_column("Status")
-    table.add_column("Notes", style="dim")
-
-    for i, name in enumerate(all_providers, 1):
-        if name in disabled_reasons:
-            table.add_row(
-                str(i), name, "[error]✗ unavailable[/error]", disabled_reasons[name]
-            )
-        else:
-            table.add_row(
-                str(i), name, "[success]✓ ready[/success]", _PROVIDER_NOTES.get(name, "")
-            )
-
-    console.print()
-    console.print(table)
-
-    default = ",".join(p for p in current_priority if p not in disabled_reasons)
-    console.print(
-        "\n[muted]Enter provider names in the order to try, comma-separated (i recommend using only 'genius' it's the best of them).[/muted]"
-    )
-    console.print("[muted]Example: itunes,musicbrainz,genius[/muted]\n")
-
-    while True:
-        answer = Prompt.ask(
-            "[bold]Provider order[/bold]",
-            default=default,
-            console=console,
-        ).strip()
-
-        parts = [p.strip().lower() for p in answer.split(",") if p.strip()]
-
-        # De-duplicate while preserving order.
-        seen: set[str] = set()
-        unique: list[str] = []
-        for p in parts:
-            if p not in seen:
-                seen.add(p)
-                unique.append(p)
-
-        unknown = [p for p in unique if p not in all_providers]
-        if unknown:
-            console.print(f"[error]Unknown provider(s): {', '.join(unknown)}[/error]")
-            console.print(f"[muted]Available: {', '.join(all_providers)}[/muted]")
-            continue
-
-        blocked = [p for p in unique if p in disabled_reasons]
-        if blocked:
-            console.print(f"[error]Unavailable: {', '.join(blocked)}[/error]")
-            for p in blocked:
-                console.print(f"  [muted]{p}: {disabled_reasons[p]}[/muted]")
-            continue
-
-        if not unique:
-            console.print("[error]Select at least one provider.[/error]")
-            continue
-
-        # Ollama cannot do lookups; at least one non-ollama provider is required.
-        if not [p for p in unique if p != "ollama"]:
-            console.print(
-                "[error]At least one lookup provider (non-ollama) is required.[/error]"
-            )
-            continue
-
-        console.print(f"[success]✓ Using: {' → '.join(unique)}[/success]")
-        return unique
 
 
 # =========================================================================
